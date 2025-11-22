@@ -38,12 +38,6 @@ type Choice struct {
 	FinishReason string  `json:"finish_reason"`
 }
 
-// Usage represents token usage information
-type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
 
 // ModelsResponse represents the OpenAI models list response
 type ModelsResponse struct {

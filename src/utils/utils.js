@@ -158,14 +158,21 @@ function generateGenerationConfig(parameters, enableThinking, actualModelName){
       "<|endoftext|>",
       "<|end_of_turn|>"
     ],
-    thinkingConfig: {
-      includeThoughts: enableThinking,
-      thinkingBudget: enableThinking ? 1024 : 0
+  }
+  
+  // 只在启用thinking时添加thinkingConfig
+  if (enableThinking) {
+    generationConfig.thinkingConfig = {
+      includeThoughts: true,
+      thinkingBudget: 1024
+    };
+    
+    // Claude模型需要移除topP
+    if (actualModelName.includes("claude")) {
+      delete generationConfig.topP;
     }
   }
-  if (enableThinking && actualModelName.includes("claude")){
-    delete generationConfig.topP;
-  }
+  
   return generationConfig
 }
 function convertOpenAIToolsToAntigravity(openaiTools){
@@ -184,31 +191,42 @@ function convertOpenAIToolsToAntigravity(openaiTools){
   })
 }
 function generateRequestBody(openaiMessages,modelName,parameters,openaiTools){
+  // 只对明确支持thinking的模型启用
   const enableThinking = modelName.endsWith('-thinking') || 
     modelName === 'gemini-2.5-pro' || 
-    modelName.startsWith('gemini-3-pro-') ||
-    modelName === "rev19-uic3-1p" ||
-    modelName === "gpt-oss-120b-medium"
+    modelName.startsWith('gemini-3-pro-')
   const actualModelName = modelName.endsWith('-thinking') ? modelName.slice(0, -9) : modelName;
+  
+  // 构建基础请求
+  const request = {
+    contents: openaiMessageToAntigravity(openaiMessages),
+    generationConfig: generateGenerationConfig(parameters, enableThinking, actualModelName),
+    sessionId: generateSessionId()
+  };
+  
+  // 只在有systemInstruction时添加
+  if (config.systemInstruction && config.systemInstruction.trim()) {
+    request.systemInstruction = {
+      role: "user",
+      parts: [{ text: config.systemInstruction }]
+    };
+  }
+  
+  // 只在有tools时添加
+  const tools = convertOpenAIToolsToAntigravity(openaiTools);
+  if (tools && tools.length > 0) {
+    request.tools = tools;
+    request.toolConfig = {
+      functionCallingConfig: {
+        mode: "VALIDATED"
+      }
+    };
+  }
   
   return{
     project: generateProjectId(),
     requestId: generateRequestId(),
-    request: {
-      contents: openaiMessageToAntigravity(openaiMessages),
-      systemInstruction: {
-        role: "user",
-        parts: [{ text: config.systemInstruction }]
-      },
-      tools: convertOpenAIToolsToAntigravity(openaiTools),
-      toolConfig: {
-        functionCallingConfig: {
-          mode: "VALIDATED"
-        }
-      },
-      generationConfig: generateGenerationConfig(parameters, enableThinking, actualModelName),
-      sessionId: generateSessionId()
-    },
+    request,
     model: actualModelName,
     userAgent: "antigravity"
   }

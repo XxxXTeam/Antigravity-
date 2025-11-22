@@ -34,8 +34,8 @@ type ServerConfig struct {
 }
 
 type OAuthConfig struct {
-	CallbackPort int `mapstructure:"callback_port"`
-	// ClientID, ClientSecret, Scopes 内置在代码中，不暴露在配置文件
+	// ClientID, ClientSecret, Scopes, RedirectURL 内置在代码中，不暴露在配置文件
+	// OAuth回调使用主服务器端口和 /oauth-callback 路由
 }
 
 type SecurityConfig struct {
@@ -46,13 +46,14 @@ type SecurityConfig struct {
 }
 
 type LoggingConfig struct {
-	Level      string `mapstructure:"level"`
-	Format     string `mapstructure:"format"`
-	Output     string `mapstructure:"output"`
-	MaxSize    int    `mapstructure:"max_size"`
-	MaxBackups int    `mapstructure:"max_backups"`
-	MaxAge     int    `mapstructure:"max_age"`
-	Compress   bool   `mapstructure:"compress"`
+	Level         string `mapstructure:"level"`
+	Format        string `mapstructure:"format"`
+	Output        string `mapstructure:"output"`
+	ConsoleOutput bool   `mapstructure:"console_output"`
+	MaxSize       int    `mapstructure:"max_size"`
+	MaxBackups    int    `mapstructure:"max_backups"`
+	MaxAge        int    `mapstructure:"max_age"`
+	Compress      bool   `mapstructure:"compress"`
 }
 
 type StorageConfig struct {
@@ -204,11 +205,6 @@ func setDefaults(cfg *Config) {
 		cfg.Server.WriteTimeout = 30 * time.Second
 	}
 
-	// OAuth配置（只配置端口，其他内置）
-	if cfg.OAuth.CallbackPort == 0 {
-		cfg.OAuth.CallbackPort = 8888
-	}
-
 	// 日志配置
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
@@ -219,6 +215,8 @@ func setDefaults(cfg *Config) {
 	if cfg.Logging.Output == "" {
 		cfg.Logging.Output = "logs/antigravity.log"
 	}
+	// Console output enabled by default
+	cfg.Logging.ConsoleOutput = true
 	if cfg.Logging.MaxSize == 0 {
 		cfg.Logging.MaxSize = 100
 	}

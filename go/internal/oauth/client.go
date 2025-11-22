@@ -44,12 +44,14 @@ type Client struct {
 	logger       *zap.Logger
 	server       *http.Server
 	accountStore *storage.AccountStore
+	stopRefresh  chan struct{}
+	currentIndex int
 }
 
 // NewClient creates a new OAuth client
-func NewClient(callbackPort int, accountsDir string, logger *zap.Logger) *Client {
-	// 构建回调URL - 使用当前服务器端口
-	redirectURL := fmt.Sprintf("http://localhost:%d/oauth-callback", callbackPort)
+func NewClient(serverPort int, accountsDir string, logger *zap.Logger) *Client {
+	// 构建回调URL - 使用主服务器端口和 /oauth-callback 路由
+	redirectURL := fmt.Sprintf("http://localhost:%d/oauth-callback", serverPort)
 
 	return &Client{
 		config: &oauth2.Config{
@@ -61,6 +63,7 @@ func NewClient(callbackPort int, accountsDir string, logger *zap.Logger) *Client
 		},
 		logger:       logger,
 		accountStore: storage.NewAccountStore(accountsDir),
+		stopRefresh:  make(chan struct{}),
 	}
 }
 
@@ -77,6 +80,11 @@ func (c *Client) GetAuthCodeURL(state string) string {
 // GetOAuthConfig 获取OAuth配置（用于token交换）
 func (c *Client) GetOAuthConfig() *oauth2.Config {
 	return c.config
+}
+
+// AccountStore returns the account store
+func (c *Client) AccountStore() *storage.AccountStore {
+	return c.accountStore
 }
 
 // GetUserInfo 获取用户信息（公开方法）
@@ -153,7 +161,7 @@ func (c *Client) StartLoginFlow() (*models.Account, error) {
 	})
 
 	c.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", 8888),
+		Addr:    fmt.Sprintf(":%d", extractPortFromRedirectURL(c.config.RedirectURL)),
 		Handler: mux,
 	}
 
@@ -253,20 +261,213 @@ func (c *Client) handleCallback(w http.ResponseWriter, r *http.Request, expected
 	// 返回成功页面
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `
-		<html>
-		<head><title>Login Successful</title></head>
-		<body style="font-family: Arial, sans-serif; padding: 50px; text-align: center;">
-			<h1 style="color: #27ae60;">✅ Login Successful!</h1>
-			<p>Email: <strong>%s</strong></p>
-			<p>Account ID: <code>%s</code></p>
-			<p>Models: <strong>%d</strong></p>
-			<hr>
-			<p style="color: #7f8c8d;">You can close this window and return to the terminal.</p>
+		<!DOCTYPE html>
+		<html lang="en">
+		<head>
+			<meta charset="UTF-8">
+			<meta name="viewport" content="width=device-width, initial-scale=1.0">
+			<title>Login Successful</title>
+			<style>
+				body {
+					font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+					background-color: #f0f2f5;
+					display: flex;
+					justify-content: center;
+					align-items: center;
+					height: 100vh;
+					margin: 0;
+				}
+				.container {
+					background-color: white;
+					padding: 40px;
+					border-radius: 10px;
+					box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+					text-align: center;
+					max-width: 400px;
+					width: 100%%;
+				}
+				h1 {
+					color: #27ae60;
+					margin-bottom: 20px;
+				}
+				.info {
+					text-align: left;
+					margin-top: 20px;
+					background-color: #f8f9fa;
+					padding: 15px;
+					border-radius: 5px;
+				}
+				.info p {
+					margin: 10px 0;
+					color: #2c3e50;
+				}
+				.label {
+					font-weight: bold;
+					color: #7f8c8d;
+				}
+				code {
+					background-color: #eec;
+					padding: 2px 5px;
+					border-radius: 3px;
+					font-family: monospace;
+				}
+				.footer {
+					margin-top: 30px;
+					color: #95a5a6;
+					font-size: 0.9em;
+				}
+			</style>
+		</head>
+		<body>
+			<div class="container">
+				<h1>✅ Login Successful!</h1>
+				<p>You have successfully authenticated with Google.</p>
+				
+				<div class="info">
+					<p><span class="label">Email:</span> <strong>%s</strong></p>
+					<p><span class="label">Account ID:</span> <code>%s</code></p>
+					<p><span class="label">Models Available:</span> <strong>%d</strong></p>
+				</div>
+
+				<div class="footer">
+					<p>You can close this window and return to the terminal.</p>
+				</div>
+			</div>
 		</body>
 		</html>
 	`, account.Email, account.AccountID, len(modelList))
 
 	return account, nil
+}
+
+// RefreshToken refreshes a single account's token
+func (c *Client) RefreshToken(account *models.Account) error {
+	c.logger.Info("Refreshing token", zap.String("account_id", account.AccountID))
+
+	// Create a new token source
+	token := &oauth2.Token{
+		RefreshToken: account.RefreshToken,
+		Expiry:       time.Now(), // Force refresh
+	}
+
+	tokenSource := c.config.TokenSource(context.Background(), token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		c.logger.Error("Failed to refresh token",
+			zap.String("account_id", account.AccountID),
+			zap.Error(err))
+		account.RecordFailure(err.Error())
+		// Save account with error status
+		_ = c.accountStore.Save(account)
+		return err
+	}
+
+	// Update account with new token
+	account.AccessToken = newToken.AccessToken
+	if newToken.RefreshToken != "" {
+		account.RefreshToken = newToken.RefreshToken
+	}
+	account.ExpiresIn = int(time.Until(newToken.Expiry).Seconds())
+	account.Timestamp = time.Now().UnixMilli()
+
+	// Fetch updated models
+	models, err := c.fetchModels(account.AccessToken)
+	if err == nil {
+		account.Models = models
+	} else {
+		c.logger.Warn("Failed to update models during refresh", zap.Error(err))
+	}
+
+	account.RecordSuccess()
+
+	// Save updated account
+	if err := c.accountStore.Save(account); err != nil {
+		return fmt.Errorf("failed to save refreshed account: %w", err)
+	}
+
+	c.logger.Info("Token refreshed successfully",
+		zap.String("account_id", account.AccountID),
+		zap.Int("expires_in", account.ExpiresIn))
+
+	return nil
+}
+
+// RefreshAllTokens refreshes all accounts that need it
+func (c *Client) RefreshAllTokens() {
+	c.logger.Info("Starting batch token refresh...")
+	accountIDs, err := c.accountStore.List()
+	if err != nil {
+		c.logger.Error("Failed to list accounts for refresh", zap.Error(err))
+		return
+	}
+
+	successCount := 0
+	failCount := 0
+	skippedCount := 0
+
+	for _, accountID := range accountIDs {
+		account, err := c.accountStore.Load(accountID)
+		if err != nil {
+			c.logger.Error("Failed to load account for refresh",
+				zap.String("account_id", accountID),
+				zap.Error(err))
+			continue
+		}
+
+		if !account.Enable {
+			skippedCount++
+			continue
+		}
+
+		if account.IsInCooldown() {
+			c.logger.Info("Skipping account in cooldown",
+				zap.String("account_id", account.AccountID),
+				zap.Int64("failed_until", *account.ErrorTracking.FailedUntil))
+			skippedCount++
+			continue
+		}
+
+		if account.NeedsRefresh() {
+			if err := c.RefreshToken(account); err != nil {
+				failCount++
+			} else {
+				successCount++
+			}
+		} else {
+			skippedCount++
+		}
+	}
+
+	c.logger.Info("Batch refresh completed",
+		zap.Int("success", successCount),
+		zap.Int("failed", failCount),
+		zap.Int("skipped", skippedCount))
+}
+
+// StartBackgroundRefresh starts the background token refresh scheduler
+func (c *Client) StartBackgroundRefresh() {
+	ticker := time.NewTicker(30 * time.Minute)
+	go func() {
+		c.logger.Info("Background token refresh scheduler started (every 30m)")
+		// Run immediately on start
+		c.RefreshAllTokens()
+
+		for {
+			select {
+			case <-ticker.C:
+				c.RefreshAllTokens()
+			case <-c.stopRefresh:
+				ticker.Stop()
+				c.logger.Info("Background token refresh scheduler stopped")
+				return
+			}
+		}
+	}()
+}
+
+// StopBackgroundRefresh stops the background token refresh scheduler
+func (c *Client) StopBackgroundRefresh() {
+	close(c.stopRefresh)
 }
 
 func (c *Client) getUserInfo(accessToken string) (*UserInfo, error) {
@@ -394,6 +595,61 @@ func min(a, b int) int {
 	return b
 }
 
+// GetToken returns a valid access token, rotating through available accounts
+func (c *Client) GetToken() (*models.Account, error) {
+	accountIDs, err := c.accountStore.List()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list accounts: %w", err)
+	}
+
+	if len(accountIDs) == 0 {
+		return nil, fmt.Errorf("no accounts available")
+	}
+
+	// Try up to len(accountIDs) times to find a valid token
+	for i := 0; i < len(accountIDs); i++ {
+		// Round-robin selection
+		c.currentIndex = (c.currentIndex + 1) % len(accountIDs)
+		accountID := accountIDs[c.currentIndex]
+
+		account, err := c.accountStore.Load(accountID)
+		if err != nil {
+			c.logger.Warn("Failed to load account during rotation",
+				zap.String("account_id", accountID),
+				zap.Error(err))
+			continue
+		}
+
+		// Skip disabled accounts
+		if !account.Enable {
+			continue
+		}
+
+		// Skip accounts in cooldown
+		if account.IsInCooldown() {
+			continue
+		}
+
+		// Check if token needs refresh
+		if account.NeedsRefresh() {
+			if err := c.RefreshToken(account); err != nil {
+				c.logger.Warn("Failed to refresh token during rotation",
+					zap.String("account_id", accountID),
+					zap.Error(err))
+				continue
+			}
+		}
+
+		c.logger.Debug("Selected account for request",
+			zap.String("account_id", account.AccountID),
+			zap.String("email", account.Email))
+		
+		return account, nil
+	}
+
+	return nil, fmt.Errorf("no valid accounts available (all disabled, in cooldown, or failed refresh)")
+}
+
 func (c *Client) shutdown() {
 	if c.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -418,4 +674,16 @@ func generateAccountID(email string) string {
 	b := make([]byte, 4)
 	rand.Read(b)
 	return fmt.Sprintf("%s_%x", email, b)
+}
+
+// extractPortFromRedirectURL extracts port from redirect URL
+func extractPortFromRedirectURL(redirectURL string) int {
+	// redirectURL format: http://localhost:PORT/oauth-callback
+	// Extract port from URL
+	var port int
+	fmt.Sscanf(redirectURL, "http://localhost:%d/", &port)
+	if port == 0 {
+		port = 8045 // Default server port
+	}
+	return port
 }

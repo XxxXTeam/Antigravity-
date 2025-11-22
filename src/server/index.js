@@ -29,7 +29,15 @@ ensureDirectories();
 
 const app = express();
 
-app.use(express.json({ limit: config.security.maxRequestSize }));
+app.use(express.json({ 
+  limit: config.security.maxRequestSize,
+  verify: (req, res, buf, encoding) => {
+    // 监听请求中止事件
+    req.on('aborted', () => {
+      req.aborted = true;
+    });
+  }
+}));
 
 // 静态文件服务 - 提供管理控制台页面
 app.use(express.static(path.join(process.cwd(), 'public')));
@@ -38,6 +46,13 @@ app.use((err, req, res, next) => {
   if (err.type === 'entity.too.large') {
     return res.status(413).json({ error: `请求体过大，最大支持 ${config.security.maxRequestSize}` });
   }
+  
+  // 处理请求中止错误
+  if (err.message === 'request aborted' || err.code === 'ECONNRESET') {
+    logger.warn(`请求中止: ${req.method} ${req.path}`);
+    return; // 静默处理，不发送响应
+  }
+  
   next(err);
 });
 
@@ -49,6 +64,14 @@ app.use((req, res, next) => {
   }
 
   const start = Date.now();
+  
+  // 监听客户端连接关闭
+  req.on('close', () => {
+    if (!res.writableEnded) {
+      logger.warn(`客户端提前关闭连接: ${req.method} ${req.path}`);
+    }
+  });
+  
   res.on('finish', () => {
     const duration = Date.now() - start;
     logger.request(req.method, req.path, res.statusCode, duration);
@@ -126,7 +149,14 @@ app.get('/v1/models', async (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-  const { messages, model, stream = true, tools, ...params} = req.body;
+  const { messages, model, stream = false, tools, ...params} = req.body;
+  
+  // 检查请求是否已中止
+  if (req.aborted) {
+    logger.warn('请求已被中止');
+    return;
+  }
+  
   try {
     
     if (!messages) {
@@ -155,7 +185,17 @@ app.post('/v1/chat/completions', async (req, res) => {
             model,
             choices: [{ index: 0, delta: { tool_calls: data.tool_calls }, finish_reason: null }]
           })}\n\n`);
+        } else if (data.type === 'thinking') {
+          // reasoning内容使用单独的字段
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: { reasoning: data.content }, finish_reason: null }]
+          })}\n\n`);
         } else {
+          // text内容使用content字段
           res.write(`data: ${JSON.stringify({
             id,
             object: 'chat.completion.chunk',
@@ -174,19 +214,33 @@ app.post('/v1/chat/completions', async (req, res) => {
         choices: [{ index: 0, delta: {}, finish_reason: hasToolCall ? 'tool_calls' : 'stop' }]
       })}\n\n`);
       res.write('data: [DONE]\n\n');
-      res.end();
+      
+      // 安全结束响应
+      if (!res.writableEnded) {
+        res.end();
+      }
     } else {
-      let fullContent = '';
+      let textContent = '';
+      let thinkingContent = '';
       let toolCalls = [];
+      
       await generateAssistantResponse(requestBody, (data) => {
         if (data.type === 'tool_calls') {
           toolCalls = data.tool_calls;
-        } else {
-          fullContent += data.content;
+        } else if (data.type === 'thinking') {
+          thinkingContent += data.content;
+        } else if (data.type === 'text') {
+          textContent += data.content;
         }
       });
       
-      const message = { role: 'assistant', content: fullContent };
+      const message = { role: 'assistant', content: textContent };
+      
+      // 添加reasoning字段（如果存在）
+      if (thinkingContent) {
+        message.reasoning = thinkingContent;
+      }
+      
       if (toolCalls.length > 0) {
         message.tool_calls = toolCalls;
       }
@@ -227,11 +281,38 @@ app.post('/v1/chat/completions', async (req, res) => {
           choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
         })}\n\n`);
         res.write('data: [DONE]\n\n');
-        res.end();
+        
+        // 安全结束响应
+        if (!res.writableEnded) {
+          res.end();
+        }
       } else {
         res.status(500).json({ error: error.message });
       }
     }
+  }
+});
+
+// 最终错误处理器
+app.use((err, req, res, next) => {
+  // 忽略连接已关闭的错误
+  if (err.message === 'request aborted' || 
+      err.code === 'ECONNRESET' || 
+      err.code === 'ECONNABORTED' ||
+      err.code === 'EPIPE') {
+    logger.debug(`连接错误已忽略: ${err.message}`);
+    return;
+  }
+  
+  // 记录其他错误
+  logger.error('未处理的错误:', err);
+  
+  // 只在响应未发送时发送错误响应
+  if (!res.headersSent) {
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: process.env.DEBUG ? err.message : undefined
+    });
   }
 });
 
@@ -267,3 +348,27 @@ const shutdown = () => {
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// 处理未捕获的异常
+process.on('uncaughtException', (error) => {
+  // 忽略连接错误
+  if (error.message === 'request aborted' || 
+      error.code === 'ECONNRESET' || 
+      error.code === 'ECONNABORTED' ||
+      error.code === 'EPIPE') {
+    logger.debug(`未捕获的连接错误已忽略: ${error.message}`);
+    return;
+  }
+  
+  logger.error('未捕获的异常:', error);
+  
+  // 对于其他严重错误，优雅关闭
+  if (error.fatal !== false) {
+    shutdown();
+  }
+});
+
+// 处理未处理的Promise拒绝
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('未处理的Promise拒绝:', reason);
+});

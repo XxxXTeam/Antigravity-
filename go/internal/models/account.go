@@ -75,3 +75,49 @@ func (a *Account) NeedsRefresh() bool {
 	expiryTime := time.Unix(a.Timestamp/1000, 0).Add(time.Duration(a.ExpiresIn) * time.Second)
 	return time.Until(expiryTime) < 30*time.Minute
 }
+
+// RecordSuccess updates account status on successful operation
+func (a *Account) RecordSuccess() {
+	a.RefreshStatus = "success"
+	a.LastRefresh = time.Now().UnixMilli()
+	if a.ErrorTracking == nil {
+		a.ErrorTracking = &ErrorTracking{}
+	}
+	a.ErrorTracking.ConsecutiveFailures = 0
+	a.ErrorTracking.LastError = ""
+	a.ErrorTracking.LastErrorTime = nil
+	a.ErrorTracking.FailedUntil = nil
+}
+
+// RecordFailure updates account status on failed operation
+func (a *Account) RecordFailure(err string) {
+	a.RefreshStatus = "failed"
+	if a.ErrorTracking == nil {
+		a.ErrorTracking = &ErrorTracking{}
+	}
+	a.ErrorTracking.ConsecutiveFailures++
+	a.ErrorTracking.LastError = err
+	now := time.Now().Unix()
+	a.ErrorTracking.LastErrorTime = &now
+
+	// Calculate cooldown: 2^failures seconds, max 1 hour
+	cooldownSeconds := int64(1 << a.ErrorTracking.ConsecutiveFailures)
+	if cooldownSeconds > 3600 {
+		cooldownSeconds = 3600
+	}
+	failedUntil := now + cooldownSeconds
+	a.ErrorTracking.FailedUntil = &failedUntil
+}
+
+// RecordUsage updates usage statistics
+func (a *Account) RecordUsage(inputTokens, outputTokens int64) {
+	if a.Usage == nil {
+		a.Usage = &UsageStats{}
+	}
+	a.Usage.RequestCount++
+	a.Usage.TotalTokens += inputTokens + outputTokens
+	a.Usage.InputTokens += inputTokens
+	a.Usage.OutputTokens += outputTokens
+	now := time.Now().UnixMilli()
+	a.Usage.LastUsed = &now
+}

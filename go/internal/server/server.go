@@ -7,15 +7,20 @@ import (
 	"strings"
 
 	"github.com/antigravity/api-proxy/internal/config"
+	"github.com/antigravity/api-proxy/internal/oauth"
+	"github.com/antigravity/api-proxy/internal/storage"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
 
 // Server represents the API server
 type Server struct {
-	cfg    *config.Config
-	logger *zap.Logger
-	router *gin.Engine
+	cfg         *config.Config
+	logger      *zap.Logger
+	router      *gin.Engine
+	oauthClient *oauth.Client
+	keyStore    *storage.KeyStore
+	usageStore  *storage.UsageStore
 }
 
 // New creates a new server instance
@@ -28,6 +33,14 @@ func New(cfg *config.Config, logger *zap.Logger) (*Server, error) {
 		logger: logger,
 		router: gin.New(),
 	}
+
+	// Initialize storage
+	s.keyStore = storage.NewKeyStore(cfg.Storage.KeysDir)
+	s.usageStore = storage.NewUsageStore(cfg.Storage.UsageDir)
+
+	// Initialize OAuth client (uses server port for callback)
+	s.oauthClient = oauth.NewClient(cfg.Server.Port, cfg.Storage.AccountsDir, logger)
+	s.oauthClient.StartBackgroundRefresh()
 
 	// 设置中间件
 	s.setupMiddleware()
@@ -92,6 +105,7 @@ func (s *Server) setupRoutes() {
 			auth.PATCH("/tokens/:id", s.toggleToken)
 			auth.DELETE("/tokens/:id", s.deleteToken)
 			auth.GET("/tokens/stats", s.getTokenStats)
+			auth.GET("/tokens/usage", s.getTokenUsage)
 
 			// 密钥管理
 			auth.GET("/keys", s.listKeys)

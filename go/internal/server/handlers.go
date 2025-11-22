@@ -11,7 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/antigravity/api-proxy/internal/logger"
+	"github.com/antigravity/api-proxy/internal/models"
 	"github.com/antigravity/api-proxy/internal/oauth"
+	"github.com/antigravity/api-proxy/internal/storage"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -228,12 +231,11 @@ func (s *Server) getTokenStats(c *gin.Context) {
 	accountsDir := s.cfg.Storage.AccountsDir
 	entries, _ := os.ReadDir(accountsDir)
 
-	totalTokens := 0
-	activeTokens := 0
+	enabled := 0
+	disabled := 0
 
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
-			totalTokens++
 			// 读取文件检查enable状态
 			filePath := filepath.Join(accountsDir, entry.Name())
 			data, err := os.ReadFile(filePath)
@@ -241,7 +243,9 @@ func (s *Server) getTokenStats(c *gin.Context) {
 				var account map[string]interface{}
 				if json.Unmarshal(data, &account) == nil {
 					if enable, ok := account["enable"].(bool); ok && enable {
-						activeTokens++
+						enabled++
+					} else {
+						disabled++
 					}
 				}
 			}
@@ -249,26 +253,147 @@ func (s *Server) getTokenStats(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{
-		"totalTokens":   totalTokens,
-		"activeTokens":  activeTokens,
-		"totalRequests": 0,
+		"enabled":  enabled,
+		"disabled": disabled,
+	})
+}
+
+func (s *Server) getTokenUsage(c *gin.Context) {
+	// 获取 Token 轮询使用统计
+	accountsDir := s.cfg.Storage.AccountsDir
+	entries, _ := os.ReadDir(accountsDir)
+
+	var tokenStats []gin.H
+	totalRequests := 0
+	currentIndex := 0 // TODO: Track actual round-robin index if implementing load balancing
+
+	for i, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+			filePath := filepath.Join(accountsDir, entry.Name())
+			data, err := os.ReadFile(filePath)
+			if err == nil {
+				var account map[string]interface{}
+				if json.Unmarshal(data, &account) == nil {
+					requests := 0
+					var lastUsed interface{}
+
+					// Extract usage info if available
+					if usage, ok := account["usage"].(map[string]interface{}); ok {
+						if reqCount, ok := usage["requestCount"].(float64); ok {
+							requests = int(reqCount)
+							totalRequests += requests
+						}
+						lastUsed = usage["lastUsed"]
+					}
+
+					tokenStats = append(tokenStats, gin.H{
+						"index":     i,
+						"requests":  requests,
+						"lastUsed":  lastUsed,
+						"isCurrent": i == currentIndex,
+					})
+				}
+			}
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"totalTokens":   len(tokenStats),
+		"currentIndex":  currentIndex,
+		"totalRequests": totalRequests,
+		"tokens":        tokenStats,
 	})
 }
 
 func (s *Server) getUsageSummary(c *gin.Context) {
 	// 获取使用统计摘要
+	accountsDir := s.cfg.Storage.AccountsDir
+	entries, _ := os.ReadDir(accountsDir)
+
+	totalRequests := 0
+	totalTokens := 0
+	inputTokens := 0
+	outputTokens := 0
+	activeAccounts := 0
+
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+			totalTokens++
+			filePath := filepath.Join(accountsDir, entry.Name())
+			data, err := os.ReadFile(filePath)
+			if err == nil {
+				var account map[string]interface{}
+				if json.Unmarshal(data, &account) == nil {
+					if enable, ok := account["enable"].(bool); ok && enable {
+						activeAccounts++
+					}
+					
+					// Aggregate usage if available
+					if usage, ok := account["usage"].(map[string]interface{}); ok {
+						if total, ok := usage["total_requests"].(float64); ok {
+							totalRequests += int(total)
+						}
+						if input, ok := usage["input_tokens"].(float64); ok {
+							inputTokens += int(input)
+						}
+						if output, ok := usage["output_tokens"].(float64); ok {
+							outputTokens += int(output)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	c.JSON(200, gin.H{
-		"totalRequests":  0,
-		"totalTokens":    0,
-		"inputTokens":    0,
-		"outputTokens":   0,
-		"activeAccounts": 0,
+		"totalRequests":  totalRequests,
+		"totalTokens":    totalTokens,
+		"inputTokens":    inputTokens,
+		"outputTokens":   outputTokens,
+		"activeAccounts": activeAccounts,
 	})
 }
 
 func (s *Server) getUsageHistory(c *gin.Context) {
-	// 获取使用历史
-	c.JSON(200, gin.H{"data": []interface{}{}})
+	// Get usage history for the last 30 days
+	history, err := s.usageStore.GetUsageHistory(30)
+	if err != nil {
+		s.logger.Error("Failed to get usage history", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to get usage history"})
+		return
+	}
+
+	// Group by date for aggregated view
+	dateMap := make(map[string]*storage.UsageRecord)
+	for _, record := range history {
+		if existing, ok := dateMap[record.Date]; ok {
+			existing.TotalTokens += record.TotalTokens
+			existing.InputTokens += record.InputTokens
+			existing.OutputTokens += record.OutputTokens
+			existing.RequestCount += record.RequestCount
+		} else {
+			copy := record
+			dateMap[record.Date] = &copy
+		}
+	}
+
+	// Convert to array
+	var result []gin.H
+	for _, record := range dateMap {
+		result = append(result, gin.H{
+			"date":         record.Date,
+			"totalTokens":  record.TotalTokens,
+			"inputTokens":  record.InputTokens,
+			"outputTokens": record.OutputTokens,
+			"requestCount": record.RequestCount,
+		})
+	}
+
+	if result == nil {
+		result = []gin.H{}
+	}
+
+	c.JSON(200, result)
 }
 
 func (s *Server) getUsage(c *gin.Context) {
@@ -287,35 +412,118 @@ func (s *Server) getUsage(c *gin.Context) {
 // ==================== 密钥管理 ====================
 
 func (s *Server) listKeys(c *gin.Context) {
-	c.JSON(200, gin.H{"keys": []interface{}{}})
+	keys, err := s.keyStore.List()
+	if err != nil {
+		s.logger.Error("Failed to list keys", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to list keys"})
+		return
+	}
+
+	// Convert to response format
+	var response []gin.H
+	for _, key := range keys {
+		response = append(response, gin.H{
+			"key":        key.Key,
+			"name":       key.Name,
+			"createdAt":  key.CreatedAt,
+			"lastUsed":   key.LastUsed,
+			"usageCount": key.UsageCount,
+		})
+	}
+
+	if response == nil {
+		response = []gin.H{}
+	}
+
+	c.JSON(200, response)
 }
 
 func (s *Server) generateKey(c *gin.Context) {
-	key := fmt.Sprintf("sk-%s", generateRandomString(32))
+	var req struct {
+		Name string `json:"name"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.Name = "Default Key"
+	}
+
+	// Generate a new key
+	keyString := fmt.Sprintf("sk-antigravity-%s", generateRandomString(32))
+	now := time.Now().UnixMilli()
+
+	apiKey := &models.APIKey{
+		Key:        keyString,
+		Name:       req.Name,
+		CreatedAt:  now,
+		UsageCount: 0,
+	}
+
+	// Save the key
+	if err := s.keyStore.Save(apiKey); err != nil {
+		s.logger.Error("Failed to save key", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to generate key"})
+		return
+	}
+
+	s.logger.Info("API key generated", zap.String("key", keyString), zap.String("name", req.Name))
+
 	c.JSON(200, gin.H{
-		"key":     key,
-		"created": time.Now().Unix(),
+		"key":       keyString,
+		"name":      req.Name,
+		"createdAt": now,
+		"message":   "Key generated successfully. Save it securely!",
 	})
 }
 
 func (s *Server) deleteKey(c *gin.Context) {
+	keyString := c.Param("key")
+
+	if err := s.keyStore.Delete(keyString); err != nil {
+		if os.IsNotExist(err) {
+			c.JSON(404, gin.H{"error": "Key not found"})
+			return
+		}
+		s.logger.Error("Failed to delete key", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to delete key"})
+		return
+	}
+
+	s.logger.Info("API key deleted", zap.String("key", keyString))
 	c.JSON(200, gin.H{"success": true})
 }
 
 func (s *Server) getKeyStats(c *gin.Context) {
+	keys, err := s.keyStore.List()
+	if err != nil {
+		s.logger.Error("Failed to get key stats", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to get stats"})
+		return
+	}
+
+	totalKeys := len(keys)
+	totalRequests := int64(0)
+
+	for _, key := range keys {
+		totalRequests += key.UsageCount
+	}
+
 	c.JSON(200, gin.H{
-		"totalKeys":     0,
-		"totalRequests": 0,
+		"totalKeys":     totalKeys,
+		"totalRequests": totalRequests,
 	})
 }
 
 // ==================== 日志和监控 ====================
 
 func (s *Server) getLogs(c *gin.Context) {
-	c.JSON(200, gin.H{"logs": []interface{}{}})
+	limit := 100
+	// Parse limit from query if needed, but for now default to 100
+	logs := logger.GlobalBuffer.GetRecent(limit)
+	c.JSON(200, logs)
 }
 
 func (s *Server) clearLogs(c *gin.Context) {
+	logger.GlobalBuffer.Clear()
 	c.JSON(200, gin.H{"success": true})
 }
 
@@ -324,12 +532,32 @@ func (s *Server) getSystemStatus(c *gin.Context) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
+	// Format memory usage
+	memoryUsage := fmt.Sprintf("%.2f MB", float64(m.Alloc)/1024/1024)
+
+	// CPU usage (placeholder - Go doesn't easily provide this without external libs)
+	cpuUsage := "0"
+
+	// Uptime (placeholder - requires tracking server start time)
+	uptime := "0h 0m"
+
+	// System info
+	nodeVersion := runtime.Version() // Go version
+	platform := runtime.GOOS
+	pid := os.Getpid()
+	systemMemory := fmt.Sprintf("%.2f GB", float64(m.Sys)/1024/1024/1024)
+
 	c.JSON(200, gin.H{
-		"cpuUsage":     "0%",
-		"memoryUsage":  fmt.Sprintf("%.0f%%", float64(m.Alloc)*100/float64(m.Sys)),
-		"uptime":       "0d 0h 0m",
-		"activeModels": 0,
-		"systemStatus": "active",
+		"cpu":          cpuUsage,
+		"memory":       memoryUsage,
+		"uptime":       uptime,
+		"requests":     0, // TODO: Track total requests
+		"idle":         "活跃",
+		"idleTime":     0,
+		"nodeVersion":  nodeVersion,
+		"platform":     platform,
+		"pid":          pid,
+		"systemMemory": systemMemory,
 	})
 }
 
@@ -337,8 +565,22 @@ func (s *Server) getSystemStatus(c *gin.Context) {
 
 func (s *Server) getSettings(c *gin.Context) {
 	c.JSON(200, gin.H{
-		"server":  s.cfg.Server,
-		"logging": s.cfg.Logging,
+		"server": gin.H{
+			"port": s.cfg.Server.Port,
+			"host": s.cfg.Server.Host,
+		},
+		"security": gin.H{
+			"apiKey":         s.cfg.Security.APIKey,
+			"adminPassword":  s.cfg.Security.AdminPassword,
+			"maxRequestSize": "50mb", // TODO: Add to config if needed
+		},
+		"defaults": gin.H{
+			"temperature": 1.0, // TODO: Add default model parameters to config
+			"top_p":       0.85,
+			"top_k":       50,
+			"max_tokens":  8096,
+		},
+		"systemInstruction": "", // TODO: Add to config if needed
 	})
 }
 

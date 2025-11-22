@@ -6,7 +6,7 @@
   "main": "src/server/index.js",
   "scripts": {
     "start": "node src/server/index.js",
-    "login": "node scripts/oauth-server.js",
+    "login": "node scripts/oauth-server.js --callback-port 8888",
     "dev": "node --watch src/server/index.js"
   },
   "keywords": [

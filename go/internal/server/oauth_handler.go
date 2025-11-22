@@ -91,7 +91,7 @@ func (s *Server) handleOAuthCallback(c *gin.Context) {
 <head>
     <title>授权成功</title>
     <style>
-        body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%); }
         .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); text-align: center; }
         .success { color: #27ae60; font-size: 48px; margin-bottom: 20px; }
         h1 { color: #2c3e50; margin: 0 0 10px 0; }

@@ -36,8 +36,8 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	log.Info("Starting OAuth login flow...")
 	log.Info("Press Ctrl+C to cancel")
 
-	// 执行OAuth流程
-	client := oauth.NewClient(cfg.OAuth.CallbackPort, cfg.Storage.AccountsDir, log)
+	// 创建OAuth客户端（使用server port作为回调端口）
+	client := oauth.NewClient(cfg.Server.Port, cfg.Storage.AccountsDir, log)
 	account, err := client.StartLoginFlow()
 	if err != nil {
 		log.Error("OAuth login failed", zap.Error(err))

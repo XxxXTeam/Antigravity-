@@ -4,12 +4,84 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/antigravity/api-proxy/internal/config"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
+
+// LogEntry represents a single log entry in the buffer
+type LogEntry struct {
+	Level     string    `json:"level"`
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// LogBuffer is a thread-safe circular buffer for logs
+type LogBuffer struct {
+	mu      sync.RWMutex
+	entries []LogEntry
+	limit   int
+}
+
+// GlobalBuffer is the singleton log buffer
+var GlobalBuffer = &LogBuffer{
+	entries: make([]LogEntry, 0, 1000),
+	limit:   1000,
+}
+
+// Add adds a log entry to the buffer
+func (b *LogBuffer) Add(level, message string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	entry := LogEntry{
+		Level:     level,
+		Message:   message,
+		Timestamp: time.Now(),
+	}
+
+	b.entries = append(b.entries, entry)
+	if len(b.entries) > b.limit {
+		// Keep the last limit entries
+		b.entries = b.entries[len(b.entries)-b.limit:]
+	}
+}
+
+// GetRecent returns the recent n logs
+func (b *LogBuffer) GetRecent(n int) []LogEntry {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if n <= 0 || n > len(b.entries) {
+		n = len(b.entries)
+	}
+
+	// Return a copy to avoid race conditions
+	// Return in reverse order (newest first) if needed, or just as is.
+	// JS implementation usually shows newest first? Let's check.
+	// Assuming newest first is better for UI.
+	result := make([]LogEntry, n)
+	start := len(b.entries) - n
+	copy(result, b.entries[start:])
+	
+	// Reverse the slice to have newest first
+	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+		result[i], result[j] = result[j], result[i]
+	}
+	
+	return result
+}
+
+// Clear clears the buffer
+func (b *LogBuffer) Clear() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.entries = make([]LogEntry, 0, b.limit)
+}
 
 // New creates a new logger instance
 func New(cfg config.LoggingConfig) (*zap.Logger, error) {
@@ -27,8 +99,8 @@ func New(cfg config.LoggingConfig) (*zap.Logger, error) {
 		level = zapcore.InfoLevel
 	}
 
-	// 编码器配置
-	encoderConfig := zapcore.EncoderConfig{
+	// 编码器配置 - JSON格式用于文件
+	jsonEncoderConfig := zapcore.EncoderConfig{
 		TimeKey:        "time",
 		LevelKey:       "level",
 		NameKey:        "logger",
@@ -43,20 +115,31 @@ func New(cfg config.LoggingConfig) (*zap.Logger, error) {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 
-	// 选择编码器
-	var encoder zapcore.Encoder
-	if cfg.Format == "json" {
-		encoder = zapcore.NewJSONEncoder(encoderConfig)
-	} else {
-		encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-		encoder = zapcore.NewConsoleEncoder(encoderConfig)
+	// 编码器配置 - 彩色格式用于控制台
+	consoleEncoderConfig := zapcore.EncoderConfig{
+		TimeKey:        "time",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		FunctionKey:    zapcore.OmitKey,
+		MessageKey:     "msg",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.CapitalColorLevelEncoder,
+		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		EncodeDuration: zapcore.SecondsDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 
-	// 日志输出
-	var writeSyncer zapcore.WriteSyncer
+	// 创建编码器
+	jsonEncoder := zapcore.NewJSONEncoder(jsonEncoderConfig)
+	consoleEncoder := zapcore.NewConsoleEncoder(consoleEncoderConfig)
 
+	// 准备cores切片
+	var cores []zapcore.Core
+
+	// 文件输出
 	if cfg.Output != "" {
-		// 文件输出（带日志轮转）
 		lumberjackLogger := &lumberjack.Logger{
 			Filename:   cfg.Output,
 			MaxSize:    cfg.MaxSize, // MB
@@ -64,17 +147,33 @@ func New(cfg config.LoggingConfig) (*zap.Logger, error) {
 			MaxAge:     cfg.MaxAge, // days
 			Compress:   cfg.Compress,
 		}
-		writeSyncer = zapcore.AddSync(lumberjackLogger)
-	} else {
-		// 标准输出
-		writeSyncer = zapcore.AddSync(os.Stdout)
+		fileWriter := zapcore.AddSync(lumberjackLogger)
+		cores = append(cores, zapcore.NewCore(jsonEncoder, fileWriter, level))
 	}
 
-	// 创建 core
-	core := zapcore.NewCore(encoder, writeSyncer, level)
+	// 控制台输出
+	if cfg.ConsoleOutput {
+		consoleWriter := zapcore.AddSync(os.Stdout)
+		cores = append(cores, zapcore.NewCore(consoleEncoder, consoleWriter, level))
+	}
+
+	// 如果没有任何输出，默认使用标准输出
+	if len(cores) == 0 {
+		consoleWriter := zapcore.AddSync(os.Stdout)
+		cores = append(cores, zapcore.NewCore(consoleEncoder, consoleWriter, level))
+	}
+
+	// 创建 Tee core (多输出)
+	core := zapcore.NewTee(cores...)
+
+	// 添加 hook 到 GlobalBuffer
+	bufferHook := func(entry zapcore.Entry) error {
+		GlobalBuffer.Add(entry.Level.String(), entry.Message)
+		return nil
+	}
 
 	// 创建 logger
-	logger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
+	logger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel), zap.Hooks(bufferHook))
 
 	return logger, nil
 }

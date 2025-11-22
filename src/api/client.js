@@ -83,6 +83,12 @@ export async function generateAssistantResponse(requestBody, callback, maxRetrie
 
         for (const line of lines) {
           const jsonStr = line.slice(6);
+          
+          // 跳过空行或无效行
+          if (!jsonStr || jsonStr.trim() === '') {
+            continue;
+          }
+          
           try {
             const data = JSON.parse(jsonStr);
             const parts = data.response?.candidates?.[0]?.content?.parts;
@@ -98,16 +104,12 @@ export async function generateAssistantResponse(requestBody, callback, maxRetrie
             if (parts) {
               for (const part of parts) {
                 if (part.thought === true) {
-                  if (!thinkingStarted) {
-                    callback({ type: 'thinking', content: '<think>\n' });
-                    thinkingStarted = true;
-                  }
+                  // 思考内容直接发送，不添加<think>标签
+                  thinkingStarted = true;
                   callback({ type: 'thinking', content: part.text || '' });
                 } else if (part.text !== undefined) {
-                  if (thinkingStarted) {
-                    callback({ type: 'thinking', content: '\n</think>\n' });
-                    thinkingStarted = false;
-                  }
+                  // 结束思考模式
+                  thinkingStarted = false;
                   callback({ type: 'text', content: part.text });
                 } else if (part.functionCall) {
                   toolCalls.push({
@@ -124,15 +126,16 @@ export async function generateAssistantResponse(requestBody, callback, maxRetrie
 
             // 当遇到 finishReason 时，发送所有收集的工具调用
             if (data.response?.candidates?.[0]?.finishReason && toolCalls.length > 0) {
-              if (thinkingStarted) {
-                callback({ type: 'thinking', content: '\n</think>\n' });
-                thinkingStarted = false;
-              }
               callback({ type: 'tool_calls', tool_calls: toolCalls });
               toolCalls = [];
             }
           } catch (e) {
-            // 忽略解析错误
+            // 记录JSON解析错误（仅在调试模式）
+            if (process.env.DEBUG) {
+              logger.warn(`JSON解析失败: ${e.message}, 原始数据: ${jsonStr.substring(0, 100)}...`);
+            }
+            // 继续处理下一行
+            continue;
           }
         }
       }
