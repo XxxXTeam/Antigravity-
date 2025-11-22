@@ -1,0 +1,58 @@
+# Binaries
+/build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Go workspace file
+go.work
+
+# Dependency directories
+/vendor/
+/data
+
+# Data directories
+/data/accounts/*.json
+/data/keys/*.json
+/data/usage/*.json
+/data/config.yaml
+
+# Logs
+/logs/*.log
+/logs/*.log.*
+
+# Uploads
+/uploads/*
+!/uploads/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js (旧版本遗留)
+/node_modules/
+package-lock.json
+
+# Environment
+.env
+.env.local
+
+# Backup files
+*.backup
+*.bak
