@@ -43,6 +43,9 @@ type ErrorTracking struct {
 	LastError           string `json:"lastError,omitempty"`
 	LastErrorTime       *int64 `json:"lastErrorTime,omitempty"`
 	FailedUntil         *int64 `json:"failedUntil,omitempty"`
+	RateLimitCount      int    `json:"rateLimitCount,omitempty"`
+	RateLimitBackoff    int64  `json:"rateLimitBackoff,omitempty"`
+	IsPermissionDenied  bool   `json:"isPermissionDenied,omitempty"`
 }
 
 // IsExpired checks if the access token is expired
@@ -87,6 +90,9 @@ func (a *Account) RecordSuccess() {
 	a.ErrorTracking.LastError = ""
 	a.ErrorTracking.LastErrorTime = nil
 	a.ErrorTracking.FailedUntil = nil
+	// Reset rate limit tracking on success
+	a.ErrorTracking.RateLimitCount = 0
+	a.ErrorTracking.RateLimitBackoff = 0
 }
 
 // RecordFailure updates account status on failed operation
@@ -107,6 +113,43 @@ func (a *Account) RecordFailure(err string) {
 	}
 	failedUntil := now + cooldownSeconds
 	a.ErrorTracking.FailedUntil = &failedUntil
+}
+
+// RecordRateLimit handles 429 rate limit errors with adaptive backoff
+func (a *Account) RecordRateLimit() {
+	a.RefreshStatus = "rate_limited"
+	if a.ErrorTracking == nil {
+		a.ErrorTracking = &ErrorTracking{}
+	}
+	a.ErrorTracking.RateLimitCount++
+	a.ErrorTracking.LastError = "HTTP 429: Rate Limit Exceeded"
+	now := time.Now().Unix()
+	a.ErrorTracking.LastErrorTime = &now
+
+	// Adaptive backoff: start at 120s (2min), double each time, max 30 minutes
+	backoffSeconds := int64(120)
+	if a.ErrorTracking.RateLimitBackoff > 0 {
+		backoffSeconds = a.ErrorTracking.RateLimitBackoff * 2
+	}
+	if backoffSeconds > 1800 {
+		backoffSeconds = 1800 // Max 30 minutes
+	}
+	a.ErrorTracking.RateLimitBackoff = backoffSeconds
+	failedUntil := now + backoffSeconds
+	a.ErrorTracking.FailedUntil = &failedUntil
+}
+
+// RecordPermissionDenied handles 403 permission denied errors
+func (a *Account) RecordPermissionDenied() {
+	a.RefreshStatus = "permission_denied"
+	a.Enable = false // Disable account immediately
+	if a.ErrorTracking == nil {
+		a.ErrorTracking = &ErrorTracking{}
+	}
+	a.ErrorTracking.IsPermissionDenied = true
+	a.ErrorTracking.LastError = "HTTP 403: Permission Denied - Account does not have required entitlements"
+	now := time.Now().Unix()
+	a.ErrorTracking.LastErrorTime = &now
 }
 
 // RecordUsage updates usage statistics

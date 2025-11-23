@@ -33,77 +33,151 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Get a valid token
-	account, err := s.oauthClient.GetToken()
-	if err != nil {
-		s.logger.Error("Failed to get token", zap.Error(err))
-		c.JSON(503, gin.H{"error": "No available accounts: " + err.Error()})
-		return
-	}
+	const maxRetries = 5
+	var lastErr error
 
-	// Transform request to Google format
-	googleReq := s.transformRequest(&req)
+	// Retry loop for handling transient errors and account rotation
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Get a valid token
+		account, err := s.oauthClient.GetToken()
+		if err != nil {
+			s.logger.Error("Failed to get token",
+				zap.Int("attempt", attempt+1),
+				zap.Error(err))
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * time.Second) // Brief backoff
+			continue
+		}
 
-	// Prepare HTTP request
-	reqBody, err := json.Marshal(googleReq)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to marshal request"})
-		return
-	}
+		s.logger.Info("Using account for request",
+			zap.String("account_id", account.AccountID),
+			zap.String("email", account.Email),
+			zap.Int("attempt", attempt+1),
+			zap.Int("max_retries", maxRetries))
 
-	// Debug log
-	s.logger.Info("Sending request to Google", zap.String("body", string(reqBody)))
+		// Transform request to Google format
+		googleReq := s.transformRequest(&req)
 
-	httpReq, err := http.NewRequest("POST", googleAPIURL, bytes.NewReader(reqBody))
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to create request"})
-		return
-	}
+		// Prepare HTTP request
+		reqBody, err := json.Marshal(googleReq)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to marshal request"})
+			return
+		}
 
-	httpReq.Header.Set("Host", googleHost)
-	httpReq.Header.Set("User-Agent", userAgent)
-	httpReq.Header.Set("Authorization", "Bearer "+account.AccessToken)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept-Encoding", "gzip")
+		// Debug log
+		s.logger.Debug("Sending request to Google",
+			zap.String("account_id", account.AccountID),
+			zap.String("email", account.Email),
+			zap.Int("body_length", len(reqBody)))
 
-	// Send request
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		s.logger.Error("Google API request failed", zap.Error(err))
-		account.RecordFailure(err.Error())
-		s.oauthClient.AccountStore().Save(account) // Save error state
-		c.JSON(502, gin.H{"error": "Upstream API error: " + err.Error()})
-		return
-	}
-	defer resp.Body.Close()
+		httpReq, err := http.NewRequest("POST", googleAPIURL, bytes.NewReader(reqBody))
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to create request"})
+			return
+		}
 
-	// Handle non-200 responses
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		s.logger.Warn("Google API returned error",
-			zap.Int("status", resp.StatusCode),
-			zap.String("body", string(body)))
-		
-		account.RecordFailure(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
+		httpReq.Header.Set("Host", googleHost)
+		httpReq.Header.Set("User-Agent", userAgent)
+		httpReq.Header.Set("Authorization", "Bearer "+account.AccessToken)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept-Encoding", "gzip")
+
+		// Send request
+		client := &http.Client{Timeout: 120 * time.Second}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			s.logger.Warn("Google API request failed",
+				zap.String("account_id", account.AccountID),
+				zap.String("email", account.Email),
+				zap.Int("attempt", attempt+1),
+				zap.Error(err))
+			account.RecordFailure(err.Error())
+			s.oauthClient.AccountStore().Save(account)
+			lastErr = err
+			continue // Retry with next account
+		}
+		defer resp.Body.Close()
+
+		// Handle non-200 responses
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+
+			// Special handling for 429 Rate Limit
+			if resp.StatusCode == 429 {
+				s.logger.Warn("Rate limit encountered",
+					zap.String("account_id", account.AccountID),
+					zap.String("email", account.Email),
+					zap.Int("attempt", attempt+1),
+					zap.Int("rate_limit_count", account.ErrorTracking.RateLimitCount+1))
+				account.RecordRateLimit()
+				s.oauthClient.AccountStore().Save(account)
+				lastErr = fmt.Errorf("rate limit exceeded")
+				continue // Try next account immediately
+			}
+
+			// Special handling for 403 Permission Denied
+			if resp.StatusCode == 403 {
+				s.logger.Warn("Permission denied - disabling account",
+					zap.String("account_id", account.AccountID),
+					zap.String("email", account.Email),
+					zap.String("error", string(body)))
+				account.RecordPermissionDenied()
+				s.oauthClient.AccountStore().Save(account)
+				lastErr = fmt.Errorf("permission denied")
+				continue // Try next account immediately
+			}
+
+			// Other errors
+			s.logger.Warn("Google API returned error",
+				zap.String("account_id", account.AccountID),
+				zap.String("email", account.Email),
+				zap.Int("status", resp.StatusCode),
+				zap.String("body", string(body)),
+				zap.Int("attempt", attempt+1))
+
+			account.RecordFailure(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
+			s.oauthClient.AccountStore().Save(account)
+
+			// For 4xx errors (other than 429), don't retry
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				c.JSON(resp.StatusCode, gin.H{"error": "Upstream API error", "details": string(body)})
+				return
+			}
+
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+			continue // Retry for 5xx errors
+		}
+
+		// Success! Record and process response
+		s.logger.Info("Request successful",
+			zap.String("account_id", account.AccountID),
+			zap.String("email", account.Email),
+			zap.Int("attempt", attempt+1))
+
+		account.RecordSuccess()
 		s.oauthClient.AccountStore().Save(account)
 
-		c.JSON(resp.StatusCode, gin.H{"error": "Upstream API error", "details": string(body)})
+		// Handle streaming response
+		if req.Stream {
+			s.handleStreamResponse(c, resp.Body, req.Model, account)
+			return
+		}
+
+		// Handle normal response (aggregate SSE)
+		s.handleNormalResponse(c, resp.Body, req.Model, account)
 		return
 	}
 
-	// Record success
-	account.RecordSuccess()
-	s.oauthClient.AccountStore().Save(account)
-
-	// Handle streaming response
-	if req.Stream {
-		s.handleStreamResponse(c, resp.Body, req.Model, account)
-		return
-	}
-
-	// Handle normal response (aggregate SSE)
-	s.handleNormalResponse(c, resp.Body, req.Model, account)
+	// All retries exhausted
+	s.logger.Error("All retry attempts exhausted",
+		zap.Int("attempts", maxRetries),
+		zap.Error(lastErr))
+	c.JSON(503, gin.H{
+		"error":   "Service unavailable after retries",
+		"details": lastErr.Error(),
+		"retries": maxRetries,
+	})
 }
 
 func (s *Server) transformRequest(req *models.ChatCompletionRequest) *models.GoogleRequest {

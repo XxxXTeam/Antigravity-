@@ -622,11 +622,26 @@ func (c *Client) GetToken() (*models.Account, error) {
 
 		// Skip disabled accounts
 		if !account.Enable {
+			c.logger.Debug("Skipping disabled account",
+				zap.String("account_id", accountID),
+				zap.String("email", account.Email))
+			continue
+		}
+
+		// Skip accounts with permission denied errors
+		if account.ErrorTracking != nil && account.ErrorTracking.IsPermissionDenied {
+			c.logger.Debug("Skipping account with permission denied",
+				zap.String("account_id", accountID),
+				zap.String("email", account.Email))
 			continue
 		}
 
 		// Skip accounts in cooldown
 		if account.IsInCooldown() {
+			c.logger.Debug("Skipping account in cooldown",
+				zap.String("account_id", accountID),
+				zap.String("email", account.Email),
+				zap.Int64("failed_until", *account.ErrorTracking.FailedUntil))
 			continue
 		}
 
@@ -640,9 +655,11 @@ func (c *Client) GetToken() (*models.Account, error) {
 			}
 		}
 
-		c.logger.Debug("Selected account for request",
+		c.logger.Info("Selected account for request",
 			zap.String("account_id", account.AccountID),
-			zap.String("email", account.Email))
+			zap.String("email", account.Email),
+			zap.Int("index", c.currentIndex),
+			zap.Int("total_accounts", len(accountIDs)))
 		
 		return account, nil
 	}

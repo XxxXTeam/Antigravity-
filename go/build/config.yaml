@@ -1,0 +1,28 @@
+logging:
+    level: info
+    format: json
+    output: logs/antigravity.log
+    consoleoutput: true
+    maxsize: 100
+    maxbackups: 10
+    maxage: 30
+    compress: false
+oauth: {}
+security:
+    adminpassword: abcdefghijklmnop
+    apikey: ""
+    enablecors: false
+    allowedorigins: []
+server:
+    host: 0.0.0.0
+    port: 8045
+    mode: release
+    readtimeout: 30s
+    writetimeout: 30s
+    maxrequestsize: ""
+storage:
+    datadir: ./data
+    accountsdir: ./data/accounts
+    keysdir: ./data/keys
+    usagedir: ./data/usage
+    logsdir: ./logs
