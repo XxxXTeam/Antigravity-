@@ -156,8 +156,9 @@ type GoogleGenerationConfig struct {
 }
 
 type GoogleThinkingConfig struct {
-	IncludeThoughts bool `json:"includeThoughts"`
-	ThinkingBudget  int  `json:"thinkingBudget"`
+	IncludeThoughts bool   `json:"includeThoughts"`
+	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`  // For Gemini 2.5 and earlier
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`   // For Gemini 3 and later
 }
 
 type GoogleSystemInstruction struct {

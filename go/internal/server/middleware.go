@@ -92,7 +92,24 @@ func (s *Server) apiKeyAuthMiddleware() gin.HandlerFunc {
 			apiKey = authHeader
 		}
 
-		// Validate API key
+
+		// First, check if it matches the static API key from config (backward compatibility)
+		if s.cfg.Security.APIKey != "" && apiKey == s.cfg.Security.APIKey {
+			s.logger.Info("API request authenticated with config API key",
+				zap.String("client_ip", c.ClientIP()))
+			c.Set("api_key_source", "config")
+			c.Next()
+			return
+		}
+
+		// Log for debugging if config key doesn't match
+		if s.cfg.Security.APIKey != "" {
+			s.logger.Debug("Config API key check failed",
+				zap.String("config_key_prefix", maskAPIKey(s.cfg.Security.APIKey)),
+				zap.String("provided_key_prefix", maskAPIKey(apiKey)))
+		}
+
+		// Second, validate against dynamic API keys from keyStore
 		key, err := s.keyStore.Load(apiKey)
 		if err != nil {
 			s.logger.Warn("Invalid API key attempt",
@@ -110,7 +127,7 @@ func (s *Server) apiKeyAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Update usage
+		// Update usage for dynamic keys
 		key.UpdateUsage()
 		if err := s.keyStore.Save(key); err != nil {
 			s.logger.Error("Failed to update key usage", zap.Error(err))
@@ -118,6 +135,7 @@ func (s *Server) apiKeyAuthMiddleware() gin.HandlerFunc {
 
 		// Store key in context for later use
 		c.Set("api_key", key)
+		c.Set("api_key_source", "database")
 		
 		c.Next()
 	}

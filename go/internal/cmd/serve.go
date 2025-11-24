@@ -63,6 +63,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 		zap.Int("port", cfg.Server.Port),
 	)
 
+	// Log API key configuration status
+	if cfg.Security.APIKey != "" {
+		log.Info("Config API key is set",
+			zap.String("key_prefix", maskAPIKey(cfg.Security.APIKey)))
+	} else {
+		log.Info("No config API key set, will use dynamic keys only")
+	}
+
 	// 创建服务器
 	srv, err := server.New(cfg, log)
 	if err != nil {
@@ -121,4 +129,12 @@ func initDirectories(cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+// maskAPIKey returns a masked version of the API key for logging
+func maskAPIKey(key string) string {
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:4] + "..." + key[len(key)-4:]
 }

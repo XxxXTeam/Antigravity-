@@ -139,14 +139,23 @@ func (s *Server) chatCompletions(c *gin.Context) {
 			account.RecordFailure(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
 			s.oauthClient.AccountStore().Save(account)
 
-			// For 4xx errors (other than 429), don't retry
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			// New: treat 400, 402, 408 as retryable errors
+			if resp.StatusCode == 400 || resp.StatusCode == 402 || resp.StatusCode == 408 {
 				c.JSON(resp.StatusCode, gin.H{"error": "Upstream API error", "details": string(body)})
+				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+				continue // retry
+			}
+
+			// Other errors (including 5xx)
+			c.JSON(resp.StatusCode, gin.H{"error": "Upstream API error", "details": string(body)})
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+
+			// For 4xx errors (other than 429, 400, 402, 408), don't retry
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != 429 && resp.StatusCode != 400 && resp.StatusCode != 402 && resp.StatusCode != 408 {
 				return
 			}
 
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-			continue // Retry for 5xx errors
+			continue // Retry for 5xx errors and the new retryable 4xx codes
 		}
 
 		// Success! Record and process response
@@ -283,24 +292,44 @@ func (s *Server) transformRequest(req *models.ChatCompletionRequest) *models.Goo
 	}
 
 	if enableThinking {
-		budget := 8192
-		genConfig.ThinkingConfig = &models.GoogleThinkingConfig{
-			IncludeThoughts: true,
-			ThinkingBudget:  budget,
-		}
+		// Determine if this is a Gemini 3+ model (uses thinkingLevel) or Gemini 2.5 (uses thinkingBudget)
+		isGemini3Plus := strings.HasPrefix(modelName, "gemini-3-")
 		
-		// Ensure MaxOutputTokens is greater than ThinkingBudget
-		// If user didn't set it, or set it too low, we override it
-		minMaxTokens := budget + 4096 // Buffer for actual response
-		if genConfig.MaxOutputTokens == nil || *genConfig.MaxOutputTokens <= budget {
-			genConfig.MaxOutputTokens = &minMaxTokens
+		if isGemini3Plus {
+			// Gemini 3+ uses thinkingLevel parameter
+			genConfig.ThinkingConfig = &models.GoogleThinkingConfig{
+				IncludeThoughts: true,
+				ThinkingLevel:   "high", // Options: "low" or "high"
+			}
+			s.logger.Debug("Using Gemini 3+ thinking config with thinkingLevel",
+				zap.String("model", modelName),
+				zap.String("level", "high"))
+		} else {
+			// Gemini 2.5 and earlier use thinkingBudget parameter
+			budget := 8192
+			genConfig.ThinkingConfig = &models.GoogleThinkingConfig{
+				IncludeThoughts: true,
+				ThinkingBudget:  &budget,
+			}
+			
+			// Ensure MaxOutputTokens is greater than ThinkingBudget
+			// If user didn't set it, or set it too low, we override it
+			minMaxTokens := budget + 4096 // Buffer for actual response
+			if genConfig.MaxOutputTokens == nil || *genConfig.MaxOutputTokens <= budget {
+				genConfig.MaxOutputTokens = &minMaxTokens
+			}
+			
+			s.logger.Debug("Using Gemini 2.5 thinking config with thinkingBudget",
+				zap.String("model", modelName),
+				zap.Int("budget", budget),
+				zap.Int("max_output_tokens", *genConfig.MaxOutputTokens))
 		}
 	}
 
 	// Log the generation config for debugging
 	if enableThinking {
 		configBytes, _ := json.Marshal(genConfig)
-		fmt.Printf("DEBUG: Generation Config: %s\n", string(configBytes))
+		s.logger.Debug("Generation Config", zap.String("config", string(configBytes)))
 	}
 
 	// Build tools
