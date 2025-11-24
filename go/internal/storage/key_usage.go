@@ -99,6 +99,10 @@ func (s *KeyStore) List() ([]*models.APIKey, error) {
 
 // Delete deletes an API key file
 func (s *KeyStore) Delete(key string) error {
+	// Reject keys with dangerous path characters
+	if strings.Contains(key, "/") || strings.Contains(key, "\\") || strings.Contains(key, "..") {
+		return fmt.Errorf("invalid key format")
+	}
 	filename := sanitizeKeyFilename(key) + ".json"
 	filePath := filepath.Join(s.keysDir, filename)
 	return os.Remove(filePath)
