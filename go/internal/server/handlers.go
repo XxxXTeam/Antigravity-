@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -155,9 +157,66 @@ func (s *Server) triggerOAuthLogin(c *gin.Context) {
 }
 
 func (s *Server) addTokenFromCallback(c *gin.Context) {
-	// 这个接口已经不需要了，因为OAuth流程在triggerOAuthLogin中完成
+	var req struct {
+		CallbackUrl string `json:"callbackUrl" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	// Parse the URL to get the code
+	parsedURL, err := url.Parse(req.CallbackUrl)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid callback URL"})
+		return
+	}
+
+	code := parsedURL.Query().Get("code")
+	if code == "" {
+		c.JSON(400, gin.H{"error": "No code found in callback URL"})
+		return
+	}
+
+	// Create OAuth client
+	client := oauth.NewClient(s.cfg.Server.Port, s.cfg.Storage.AccountsDir, s.logger)
+
+	// Exchange code for token
+	token, err := client.GetOAuthConfig().Exchange(context.Background(), code)
+	if err != nil {
+		s.logger.Error("Failed to exchange code", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to exchange code for token"})
+		return
+	}
+
+	// Get user info
+	userInfo, err := client.GetUserInfo(token.AccessToken)
+	if err != nil {
+		s.logger.Error("Failed to get user info", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to get user info"})
+		return
+	}
+
+	// Save account
+	account, err := client.SaveAccountFromToken(token, userInfo)
+	if err != nil {
+		s.logger.Error("Failed to save account", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to save account"})
+		return
+	}
+
+	s.logger.Info("Account added successfully",
+		zap.String("email", account.Email),
+		zap.String("account_id", account.AccountID))
+
 	c.JSON(200, gin.H{
-		"message": "Use POST /admin/tokens/login instead",
+		"success": true,
+		"account": gin.H{
+			"id":    account.AccountID,
+			"email": account.Email,
+			"name":  account.Name,
+		},
 	})
 }
 

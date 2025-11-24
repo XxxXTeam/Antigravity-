@@ -1,8 +1,0 @@
-{"level":"info","time":"2025-11-22T23:39:03.703+0800","caller":"cmd/serve.go:59","msg":"Starting Antigravity API Proxy","version":"e579dee","build_time":"2025-11-22_15:38:54","host":"0.0.0.0","port":8045}
-{"level":"info","time":"2025-11-22T23:39:03.703+0800","caller":"server/static.go:18","msg":"Using embedded public files"}
-{"level":"info","time":"2025-11-22T23:39:03.703+0800","caller":"oauth/client.go:451","msg":"Background token refresh scheduler started (every 30m)"}
-{"level":"info","time":"2025-11-22T23:39:03.703+0800","caller":"oauth/client.go:397","msg":"Starting batch token refresh..."}
-{"level":"info","time":"2025-11-22T23:39:03.703+0800","caller":"cmd/serve.go:86","msg":"Server started","addr":"0.0.0.0:8045"}
-{"level":"info","time":"2025-11-22T23:39:03.703+0800","caller":"oauth/client.go:441","msg":"Batch refresh completed","success":0,"failed":0,"skipped":0}
-{"level":"info","time":"2025-11-22T23:39:04.704+0800","caller":"cmd/serve.go:93","msg":"Shutting down server..."}
-{"level":"info","time":"2025-11-22T23:39:04.705+0800","caller":"cmd/serve.go:103","msg":"Server stopped gracefully"}
