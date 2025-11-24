@@ -223,6 +223,12 @@ func (s *Server) addTokenFromCallback(c *gin.Context) {
 func (s *Server) toggleToken(c *gin.Context) {
 	accountID := c.Param("id")
 
+	// Validate account ID to prevent path traversal
+	if !validateAccountID(accountID) {
+		c.JSON(400, gin.H{"error": "Invalid account ID"})
+		return
+	}
+
 	var req struct {
 		Enable bool `json:"enable"`
 	}
@@ -270,6 +276,12 @@ func (s *Server) toggleToken(c *gin.Context) {
 
 func (s *Server) deleteToken(c *gin.Context) {
 	accountID := c.Param("id")
+
+	// Validate account ID to prevent path traversal
+	if !validateAccountID(accountID) {
+		c.JSON(400, gin.H{"error": "Invalid account ID"})
+		return
+	}
 
 	filePath := filepath.Join(s.cfg.Storage.AccountsDir, accountID+".json")
 	if err := os.Remove(filePath); err != nil {
@@ -663,4 +675,33 @@ func generateRandomString(length int) string {
 		b[i] = charset[i%len(charset)]
 	}
 	return string(b)
+}
+
+// validateAccountID checks if the account ID is safe to use in file paths
+// Prevents path traversal attacks by rejecting IDs containing path separators or special characters
+func validateAccountID(accountID string) bool {
+	if accountID == "" {
+		return false
+	}
+	
+	// Check for path traversal attempts
+	if strings.Contains(accountID, "..") {
+		return false
+	}
+	if strings.Contains(accountID, "/") {
+		return false
+	}
+	if strings.Contains(accountID, "\\") {
+		return false
+	}
+	
+	// Only allow alphanumeric characters, underscores, hyphens, and dots
+	for _, c := range accountID {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
+			 (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	
+	return true
 }
