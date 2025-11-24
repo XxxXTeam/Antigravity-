@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,7 +45,15 @@ func (s *Server) chatCompletions(c *gin.Context) {
 				zap.Int("attempt", attempt+1),
 				zap.Error(err))
 			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * time.Second) // Brief backoff
+
+			// If no accounts are available, don't retry
+			if strings.Contains(err.Error(), "no valid accounts available") {
+				s.logger.Warn("No valid accounts available - stopping retry attempts")
+				break
+			}
+
+			// Brief backoff before retry for transient errors
+			time.Sleep(time.Duration(attempt+1) * time.Second)
 			continue
 		}
 
@@ -121,12 +130,29 @@ func (s *Server) chatCompletions(c *gin.Context) {
 
 			// Special handling for 429 Rate Limit
 			if resp.StatusCode == 429 {
+				// Parse Retry-After header (seconds or HTTP date)
+				cooldown := int64(10) // Default 10 seconds
+				if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+					// Try parsing as seconds first
+					if seconds, err := strconv.ParseInt(retryAfter, 10, 64); err == nil && seconds > 0 {
+						cooldown = seconds
+					} else {
+						// Try parsing as HTTP date
+						if retryTime, err := time.Parse(time.RFC1123, retryAfter); err == nil {
+							if duration := time.Until(retryTime).Seconds(); duration > 0 {
+								cooldown = int64(duration)
+							}
+						}
+					}
+				}
+
 				s.logger.Warn("Rate limit encountered",
 					zap.String("account_id", account.AccountID),
 					zap.String("email", account.Email),
 					zap.Int("attempt", attempt+1),
-					zap.Int("rate_limit_count", account.ErrorTracking.RateLimitCount+1))
-				account.RecordRateLimit()
+					zap.Int("rate_limit_count", account.ErrorTracking.RateLimitCount+1),
+					zap.Int64("cooldown_seconds", cooldown))
+				account.RecordRateLimit(cooldown)
 				s.oauthClient.AccountStore().Save(account)
 				lastErr = fmt.Errorf("rate limit exceeded")
 				continue // Try next account immediately
@@ -199,21 +225,32 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		zap.Int("attempts", maxRetries),
 		zap.Error(lastErr))
 
-	// Provide detailed error response
+	// Provide detailed error response based on error type
+	var errorMessage, errorCode string
+	statusCode := 503
+
+	if lastErr != nil && strings.Contains(lastErr.Error(), "no valid accounts available") {
+		errorMessage = "All accounts are currently unavailable. They may be rate-limited or in cooldown. Please try again later."
+		errorCode = "no_accounts_available"
+		statusCode = 429 // Use 429 to indicate rate limiting
+	} else {
+		errorMessage = "Service temporarily unavailable. All retry attempts failed."
+		errorCode = "service_unavailable"
+	}
+
 	errorResponse := gin.H{
 		"error": gin.H{
-			"message": "Service temporarily unavailable. All retry attempts failed.",
+			"message": errorMessage,
 			"type":    "upstream_error",
-			"code":    "service_unavailable",
+			"code":    errorCode,
 		},
-		"retries": maxRetries,
 	}
 
 	if lastErr != nil {
 		errorResponse["error"].(gin.H)["details"] = lastErr.Error()
 	}
 
-	c.JSON(503, errorResponse)
+	c.JSON(statusCode, errorResponse)
 }
 
 func (s *Server) transformRequest(req *models.ChatCompletionRequest) *models.GoogleRequest {

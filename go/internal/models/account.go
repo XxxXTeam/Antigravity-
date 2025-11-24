@@ -115,8 +115,9 @@ func (a *Account) RecordFailure(err string) {
 	a.ErrorTracking.FailedUntil = &failedUntil
 }
 
-// RecordRateLimit handles 429 rate limit errors with adaptive backoff
-func (a *Account) RecordRateLimit() {
+// RecordRateLimit handles 429 rate limit errors with specified cooldown
+// cooldownSeconds: cooldown duration from API response or default (10s)
+func (a *Account) RecordRateLimit(cooldownSeconds int64) {
 	a.RefreshStatus = "rate_limited"
 	if a.ErrorTracking == nil {
 		a.ErrorTracking = &ErrorTracking{}
@@ -126,16 +127,9 @@ func (a *Account) RecordRateLimit() {
 	now := time.Now().Unix()
 	a.ErrorTracking.LastErrorTime = &now
 
-	// Adaptive backoff: start at 120s (2min), double each time, max 30 minutes
-	backoffSeconds := int64(120)
-	if a.ErrorTracking.RateLimitBackoff > 0 {
-		backoffSeconds = a.ErrorTracking.RateLimitBackoff * 2
-	}
-	if backoffSeconds > 1800 {
-		backoffSeconds = 1800 // Max 30 minutes
-	}
-	a.ErrorTracking.RateLimitBackoff = backoffSeconds
-	failedUntil := now + backoffSeconds
+	// Use provided cooldown (from Retry-After header or default)
+	a.ErrorTracking.RateLimitBackoff = cooldownSeconds
+	failedUntil := now + cooldownSeconds
 	a.ErrorTracking.FailedUntil = &failedUntil
 }
 
