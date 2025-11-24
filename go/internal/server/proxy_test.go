@@ -5,10 +5,13 @@ import (
 
 	"github.com/antigravity/api-proxy/internal/models"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 )
 
 func TestTransformRequest_Basic(t *testing.T) {
-	s := &Server{}
+	s := &Server{
+		logger: zap.NewNop(),
+	}
 
 	req := &models.ChatCompletionRequest{
 		Model: "gemini-2.0-flash",
@@ -30,7 +33,9 @@ func TestTransformRequest_Basic(t *testing.T) {
 }
 
 func TestTransformRequest_ThinkingModel(t *testing.T) {
-	s := &Server{}
+	s := &Server{
+		logger: zap.NewNop(),
+	}
 
 	req := &models.ChatCompletionRequest{
 		Model: "gemini-2.0-flash-thinking",
@@ -47,7 +52,9 @@ func TestTransformRequest_ThinkingModel(t *testing.T) {
 }
 
 func TestTransformRequest_SystemMessage(t *testing.T) {
-	s := &Server{}
+	s := &Server{
+		logger: zap.NewNop(),
+	}
 
 	req := &models.ChatCompletionRequest{
 		Model: "gemini-2.0-flash",
@@ -65,7 +72,9 @@ func TestTransformRequest_SystemMessage(t *testing.T) {
 }
 
 func TestTransformRequest_Tools(t *testing.T) {
-	s := &Server{}
+	s := &Server{
+		logger: zap.NewNop(),
+	}
 
 	req := &models.ChatCompletionRequest{
 		Model: "gemini-2.0-flash",

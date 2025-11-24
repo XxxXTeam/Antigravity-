@@ -1,4 +1,3 @@
-
 package server
 
 import (
@@ -83,18 +82,35 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Accept-Encoding", "gzip")
 
-		// Send request
-		client := &http.Client{Timeout: 120 * time.Second}
+		// Send request with optimized client configuration
+		client := &http.Client{
+			Timeout: 120 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		}
 		resp, err := client.Do(httpReq)
 		if err != nil {
-			s.logger.Warn("Google API request failed",
+			s.logger.Warn("Upstream API request failed",
 				zap.String("account_id", account.AccountID),
 				zap.String("email", account.Email),
 				zap.Int("attempt", attempt+1),
+				zap.String("error_type", fmt.Sprintf("%T", err)),
 				zap.Error(err))
-			account.RecordFailure(err.Error())
+
+			// Record failure with detailed error message
+			errMsg := fmt.Sprintf("request failed: %v", err)
+			account.RecordFailure(errMsg)
 			s.oauthClient.AccountStore().Save(account)
-			lastErr = err
+			lastErr = fmt.Errorf("upstream error: %w", err)
+
+			// Brief exponential backoff before retry
+			if attempt < maxRetries-1 {
+				backoff := time.Duration(attempt+1) * time.Second
+				time.Sleep(backoff)
+			}
 			continue // Retry with next account
 		}
 		defer resp.Body.Close()
@@ -182,23 +198,33 @@ func (s *Server) chatCompletions(c *gin.Context) {
 	s.logger.Error("All retry attempts exhausted",
 		zap.Int("attempts", maxRetries),
 		zap.Error(lastErr))
-	c.JSON(503, gin.H{
-		"error":   "Service unavailable after retries",
-		"details": lastErr.Error(),
+
+	// Provide detailed error response
+	errorResponse := gin.H{
+		"error": gin.H{
+			"message": "Service temporarily unavailable. All retry attempts failed.",
+			"type":    "upstream_error",
+			"code":    "service_unavailable",
+		},
 		"retries": maxRetries,
-	})
+	}
+
+	if lastErr != nil {
+		errorResponse["error"].(gin.H)["details"] = lastErr.Error()
+	}
+
+	c.JSON(503, errorResponse)
 }
 
 func (s *Server) transformRequest(req *models.ChatCompletionRequest) *models.GoogleRequest {
 	// Determine model name and thinking config
 	modelName := req.Model
-	enableThinking := strings.HasSuffix(modelName, "-thinking") || 
-		modelName == "gemini-2.5-pro" || 
+	enableThinking := strings.HasSuffix(modelName, "-thinking") ||
+		modelName == "gemini-2.5-pro" ||
 		strings.HasPrefix(modelName, "gemini-3-pro-")
-	
-	if strings.HasSuffix(modelName, "-thinking") {
-		modelName = strings.TrimSuffix(modelName, "-thinking")
-	}
+
+	// Remove -thinking suffix if present
+	modelName = strings.TrimSuffix(modelName, "-thinking")
 
 	// Build contents
 	var contents []models.GoogleContent
@@ -212,14 +238,14 @@ func (s *Server) transformRequest(req *models.ChatCompletionRequest) *models.Goo
 				text = str
 			}
 			systemInstruction = &models.GoogleSystemInstruction{
-				Role: "user", // Google system instruction uses 'user' role internally sometimes, or specific field
+				Role:  "user", // Google system instruction uses 'user' role internally sometimes, or specific field
 				Parts: []models.GooglePart{{Text: text}},
 			}
 			continue
 		}
 
 		parts := []models.GooglePart{}
-		
+
 		// Handle content (string or array)
 		switch v := msg.Content.(type) {
 		case string:
@@ -294,7 +320,7 @@ func (s *Server) transformRequest(req *models.ChatCompletionRequest) *models.Goo
 	if enableThinking {
 		// Determine if this is a Gemini 3+ model (uses thinkingLevel) or Gemini 2.5 (uses thinkingBudget)
 		isGemini3Plus := strings.HasPrefix(modelName, "gemini-3-")
-		
+
 		if isGemini3Plus {
 			// Gemini 3+ uses thinkingLevel parameter
 			genConfig.ThinkingConfig = &models.GoogleThinkingConfig{
@@ -311,14 +337,14 @@ func (s *Server) transformRequest(req *models.ChatCompletionRequest) *models.Goo
 				IncludeThoughts: true,
 				ThinkingBudget:  &budget,
 			}
-			
+
 			// Ensure MaxOutputTokens is greater than ThinkingBudget
 			// If user didn't set it, or set it too low, we override it
 			minMaxTokens := budget + 4096 // Buffer for actual response
 			if genConfig.MaxOutputTokens == nil || *genConfig.MaxOutputTokens <= budget {
 				genConfig.MaxOutputTokens = &minMaxTokens
 			}
-			
+
 			s.logger.Debug("Using Gemini 2.5 thinking config with thinkingBudget",
 				zap.String("model", modelName),
 				zap.Int("budget", budget),
@@ -373,7 +399,7 @@ func (s *Server) handleNormalResponse(c *gin.Context, body io.Reader, model stri
 	content := ""
 	reasoning := ""
 	var totalTokens, inputTokens, outputTokens int64
-	
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -439,7 +465,7 @@ func (s *Server) handleNormalResponse(c *gin.Context, body io.Reader, model stri
 		matches := re.FindStringSubmatch(content)
 		if len(matches) > 1 {
 			reasoning = strings.TrimSpace(matches[1]) // Use captured group and trim whitespace
-			
+
 			// Remove the thinking part from content
 			content = strings.Replace(content, matches[0], "", 1)
 			content = strings.TrimSpace(content)
@@ -508,7 +534,7 @@ func (s *Server) handleStreamResponse(c *gin.Context, body io.Reader, model stri
 		}
 
 		candidate := googleResp.Response.Candidates[0]
-		
+
 		for _, part := range candidate.Content.Parts {
 			chunk := models.ChatCompletionChunk{
 				ID:      "chatcmpl-" + uuid.New().String(),
