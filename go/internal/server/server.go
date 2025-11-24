@@ -79,8 +79,9 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/health", s.healthCheck)
 	s.router.GET("/ping", s.ping)
 
-	// OpenAI兼容 API
+	// OpenAI兼容 API - 需要API Key认证
 	api := s.router.Group("/v1")
+	api.Use(s.apiKeyAuthMiddleware())
 	{
 		api.POST("/chat/completions", s.chatCompletions)
 		api.GET("/models", s.listModels)

@@ -66,6 +66,63 @@ func (s *Server) corsMiddleware() gin.HandlerFunc {
 	}
 }
 
+// apiKeyAuthMiddleware validates API key for API requests
+func (s *Server) apiKeyAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Get API key from Authorization header
+		authHeader := c.GetHeader("Authorization")
+		
+		if authHeader == "" {
+			c.JSON(401, gin.H{
+				"error": gin.H{
+					"message": "Missing Authorization header",
+					"type":    "invalid_request_error",
+					"code":    "missing_api_key",
+				},
+			})
+			c.Abort()
+			return
+		}
+
+		// Extract Bearer token
+		apiKey := ""
+		if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+			apiKey = authHeader[7:]
+		} else {
+			apiKey = authHeader
+		}
+
+		// Validate API key
+		key, err := s.keyStore.Load(apiKey)
+		if err != nil {
+			s.logger.Warn("Invalid API key attempt",
+				zap.String("key_prefix", maskAPIKey(apiKey)),
+				zap.String("client_ip", c.ClientIP()))
+			
+			c.JSON(401, gin.H{
+				"error": gin.H{
+					"message": "Invalid API key",
+					"type":    "invalid_request_error",
+					"code":    "invalid_api_key",
+				},
+			})
+			c.Abort()
+			return
+		}
+
+		// Update usage
+		key.UpdateUsage()
+		if err := s.keyStore.Save(key); err != nil {
+			s.logger.Error("Failed to update key usage", zap.Error(err))
+		}
+
+		// Store key in context for later use
+		c.Set("api_key", key)
+		
+		c.Next()
+	}
+}
+
 // adminAuthMiddleware checks admin authentication
 func (s *Server) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -77,9 +134,24 @@ func (s *Server) adminAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// TODO: 验证token（使用session管理器）
-		// 这里需要实现实际的token验证逻辑
+		// Validate token against the expected admin token
+		expectedToken := generateToken(s.cfg.Security.AdminPassword)
+		if token != expectedToken {
+			s.logger.Warn("Invalid admin token attempt",
+				zap.String("client_ip", c.ClientIP()))
+			c.JSON(401, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
 
 		c.Next()
 	}
+}
+
+// maskAPIKey returns a masked version of the API key for logging
+func maskAPIKey(key string) string {
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:4] + "..." + key[len(key)-4:]
 }
